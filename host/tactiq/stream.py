@@ -11,6 +11,13 @@ Records carry the device clock (t_us, microseconds, unwrapped past the
 32-bit micros() rollover). Sources also expose now_us(), an estimate of the
 current device-clock reading, which capture uses to timestamp prompts on the
 same clock as the samples.
+
+The simulator supports four event kinds, enough to exercise every pipeline
+stage: prompted taps (capture), sustained holds (the P6 emergency grammar),
+deliberate wake squeezes and incidental pressure noise (the P9 gate and its
+false-activation sweep). Incidental press durations are drawn exponentially,
+which by construction reproduces the paper's section 3.8 model
+f(tau) = f0 * exp(-tau/tau0).
 """
 
 import math
@@ -142,6 +149,36 @@ _FINGER_AMP = {"index": 1.15, "middle": 1.05, "ring": 0.95, "pinky": 0.85}
 _BASE_FLEX = (1500, 1520)
 _BASE_FSR = (30, 28)
 
+ACCEL_TAIL_S = 0.15  # the damped oscillation dies out within this
+
+
+class _Event:
+    """One synthetic actuation: envelope on flex/FSR + accel transient."""
+
+    def __init__(self, at_us: int, flex_delta=(0.0, 0.0), fsr_peak=(0.0, 0.0),
+                 amp_g=0.0, rise=0.030, hold=0.080, fall=0.060):
+        self.at_us = at_us
+        self.flex_delta = flex_delta
+        self.fsr_peak = fsr_peak
+        self.amp_g = amp_g
+        self.rise, self.hold, self.fall = rise, hold, fall
+        self.duration = rise + hold + fall
+
+    def envelope(self, t_rel: float) -> float:
+        if t_rel < 0 or t_rel > self.duration:
+            return 0.0
+        if t_rel < self.rise:
+            return t_rel / self.rise
+        if t_rel < self.rise + self.hold:
+            return 1.0
+        return 1.0 - (t_rel - self.rise - self.hold) / self.fall
+
+    def accel(self, t_rel: float) -> float:
+        if t_rel < 0 or t_rel > ACCEL_TAIL_S or self.amp_g == 0.0:
+            return 0.0
+        return self.amp_g * math.exp(-t_rel / 0.040) * \
+            math.sin(2 * math.pi * 55 * t_rel)
+
 
 def _contact_params(finger: str, knuckle: str, rng: random.Random) -> dict:
     f1, f2 = _FINGER_FLEX[finger]
@@ -153,31 +190,6 @@ def _contact_params(finger: str, knuckle: str, rng: random.Random) -> dict:
                      jitter(60) if tip else jitter(1000)),
         "amp_g": jitter(_FINGER_AMP[finger] + (0.10 if tip else 0.0)),
     }
-
-
-class _TapEvent:
-    RISE, HOLD, FALL = 0.030, 0.080, 0.060  # seconds
-    DURATION = RISE + HOLD + FALL
-
-    def __init__(self, at_us: int, params: dict):
-        self.at_us = at_us
-        self.p = params
-
-    def envelope(self, t_rel: float) -> float:
-        if t_rel < 0 or t_rel > self.DURATION:
-            return 0.0
-        if t_rel < self.RISE:
-            return t_rel / self.RISE
-        if t_rel < self.RISE + self.HOLD:
-            return 1.0
-        return 1.0 - (t_rel - self.RISE - self.HOLD) / self.FALL
-
-    def accel(self, t_rel: float) -> float:
-        # damped oscillation at contact onset
-        if t_rel < 0 or t_rel > 0.15:
-            return 0.0
-        return self.p["amp_g"] * math.exp(-t_rel / 0.040) * \
-            math.sin(2 * math.pi * 55 * t_rel)
 
 
 class SimSource:
@@ -192,29 +204,77 @@ class SimSource:
         self._t0 = time.monotonic()
         self._next_imu = 0
         self._next_adc = 0
-        self._events: list[_TapEvent] = []
+        self._events: list[_Event] = []
+        # incidental (idle-wear) noise, off unless enabled
+        self._idle_rate_hz = 0.0
+        self._idle_next_us = None
         self.header_lines = ["# simulated source"]
         self.parse_errors = 0
 
     def now_us(self) -> int:
         return int((time.monotonic() - self._t0) * self.speed * 1_000_000)
 
-    def expect_tap(self, contact, at_us: int):
-        params = _contact_params(contact.finger, contact.knuckle, self.rng)
-        self._events.append(_TapEvent(at_us, params))
+    # -- event scheduling ----------------------------------------------------
+
+    def expect_tap(self, contact, at_us: int, hold_s: float | None = None):
+        """A prompted thumb-to-finger contact; hold_s > default for P6 holds."""
+        p = _contact_params(contact.finger, contact.knuckle, self.rng)
+        self._events.append(_Event(
+            at_us, p["flex_delta"], p["fsr_peak"], p["amp_g"],
+            hold=hold_s if hold_s is not None else 0.080))
+
+    def expect_squeeze(self, at_us: int, hold_s: float = 0.6):
+        """Deliberate wake squeeze: both FSR pads pressed, little motion."""
+        j = lambda v: v * self.rng.gauss(1.0, 0.08)
+        self._events.append(_Event(
+            at_us, (j(30), j(30)), (j(1300), j(1300)), amp_g=0.15,
+            rise=0.050, hold=max(0.1, self.rng.gauss(hold_s, 0.1)),
+            fall=0.080))
+
+    def enable_idle_noise(self, events_per_hour: float = 240.0,
+                          mean_dur_s: float = 0.11,
+                          both_pad_fraction: float = 0.30):
+        """Incidental pressure noise for the false-activation test.
+
+        Durations are exponential(mean_dur_s), so gate false activations
+        follow f(tau) = f0 * exp(-tau / mean_dur_s) — the section 3.8 model.
+        """
+        self._idle_rate_hz = events_per_hour / 3600.0
+        self._idle_mean_dur = mean_dur_s
+        self._idle_both = both_pad_fraction
+        self._idle_next_us = self._draw_idle_gap(0)
+
+    def _draw_idle_gap(self, from_us: int) -> int:
+        return from_us + int(self.rng.expovariate(self._idle_rate_hz) * 1e6)
+
+    def _schedule_idle(self, up_to_us: int):
+        while self._idle_next_us is not None and self._idle_next_us <= up_to_us:
+            at = self._idle_next_us
+            dur = self.rng.expovariate(1.0 / self._idle_mean_dur)
+            peak = self.rng.uniform(600, 1500)
+            if self.rng.random() < self._idle_both:
+                fsr = (peak, peak * self.rng.uniform(0.7, 1.0))
+            else:
+                fsr = (peak, 0.0) if self.rng.random() < 0.5 else (0.0, peak)
+            self._events.append(_Event(
+                at, (0.0, 0.0), fsr, amp_g=self.rng.uniform(0.05, 0.25),
+                rise=0.020, hold=dur, fall=0.040))
+            self._idle_next_us = self._draw_idle_gap(at)
+
+    # -- sample synthesis ----------------------------------------------------
 
     def _active(self, t_us: int):
-        window = _TapEvent.DURATION * 1_000_000
-        self._events = [e for e in self._events if t_us - e.at_us < 5_000_000]
-        return [e for e in self._events if 0 <= t_us - e.at_us <= window]
+        self._events = [e for e in self._events
+                        if (t_us - e.at_us) / 1e6 < e.duration + 1.0]
+        return [e for e in self._events
+                if 0 <= (t_us - e.at_us) / 1e6 <= max(e.duration, ACCEL_TAIL_S)]
 
     def _imu_at(self, t_us: int) -> ImuSample:
         g = self.rng.gauss
         ax, ay, az = g(0, 0.008), g(0, 0.008), 1.0 + g(0, 0.008)
         gx, gy, gz = g(0, 0.5), g(0, 0.5), g(0, 0.5)
         for e in self._active(t_us):
-            t_rel = (t_us - e.at_us) / 1_000_000
-            a = e.accel(t_rel)
+            a = e.accel((t_us - e.at_us) / 1_000_000)
             az += a
             ax += 0.4 * a
             gy += 60.0 * a
@@ -227,19 +287,18 @@ class SimSource:
         fsr = [_BASE_FSR[0] + g(0, 4), _BASE_FSR[1] + g(0, 4)]
         for e in self._active(t_us):
             env = e.envelope((t_us - e.at_us) / 1_000_000)
-            flex[0] += env * e.p["flex_delta"][0]
-            flex[1] += env * e.p["flex_delta"][1]
-            fsr[0] += env * e.p["fsr_peak"][0]
-            fsr[1] += env * e.p["fsr_peak"][1]
+            flex[0] += env * e.flex_delta[0]
+            flex[1] += env * e.flex_delta[1]
+            fsr[0] += env * e.fsr_peak[0]
+            fsr[1] += env * e.fsr_peak[1]
         clip = lambda v: max(0, min(4095, int(v)))
         return AnalogSample(t_us, clip(flex[0]), clip(flex[1]),
                             clip(fsr[0]), clip(fsr[1]))
 
-    def read(self):
-        """Generate all samples due between the last call and now."""
-        now = self.now_us()
+    def _emit_due(self, until_us: int):
+        self._schedule_idle(until_us)
         samples = []
-        while self._next_imu <= now or self._next_adc <= now:
+        while self._next_imu <= until_us or self._next_adc <= until_us:
             if self._next_imu <= self._next_adc:
                 samples.append(self._imu_at(self._next_imu))
                 self._next_imu += self.IMU_PERIOD_US
@@ -247,6 +306,20 @@ class SimSource:
                 samples.append(self._adc_at(self._next_adc))
                 self._next_adc += self.ADC_PERIOD_US
         return samples
+
+    def read(self):
+        """Generate all samples due between the last call and now."""
+        return self._emit_due(self.now_us())
+
+    def generate_until(self, t_us: int, chunk_s: float = 10.0):
+        """Batch mode: yield chunks up to t_us, ignoring the wall clock.
+
+        Used by idle-wear generation, where hours of virtual stream are
+        produced as fast as the CPU allows.
+        """
+        step = int(chunk_s * 1e6)
+        while self._next_imu < t_us or self._next_adc < t_us:
+            yield self._emit_due(min(t_us, self._next_imu + step))
 
     def close(self):
         pass

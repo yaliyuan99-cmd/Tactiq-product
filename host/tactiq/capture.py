@@ -165,6 +165,7 @@ def main(argv=None):
 
     session = {
         "schemaVersion": SCHEMA_VERSION,
+        "kind": "gesture_capture",
         "createdAt": dt.datetime.now().astimezone().isoformat(),
         "participant": args.participant,
         "hand": args.hand,
@@ -223,8 +224,8 @@ def main(argv=None):
 
     print(f"Done: {trial_index} trials, {writer.imu_count} IMU + "
           f"{writer.adc_count} analog samples -> {session_dir}")
-    return 0
+    return session_dir
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
