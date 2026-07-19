@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Tactiq Companion</string>
+    <string name="service_label">Tactiq ring commands</string>
+    <string name="service_description">Receives command tokens from the
+        Tactiq ring over Bluetooth and performs the mapped screen-reader
+        actions (next, previous, activate, back). The ring augments the
+        screen reader; it never replaces it.</string>
+</resources>

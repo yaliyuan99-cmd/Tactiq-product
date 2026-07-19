@@ -1,0 +1,261 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tactiq ring — live demo</title>
+<style>
+  :root {
+    --ink: #1f2937; --muted: #64748b; --line: #e2e8f0;
+    --blue: #2563eb; --surface: #ffffff; --bg: #f8fafc;
+    --good: #047857; --warn: #b45309;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 15px/1.5 system-ui, -apple-system, sans-serif; padding: 24px;
+  }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .sub { color: var(--muted); margin: 0 0 20px; font-size: 13px; }
+  .row { display: flex; gap: 20px; flex-wrap: wrap; align-items: flex-start; }
+  .card {
+    background: var(--surface); border: 1px solid var(--line);
+    border-radius: 10px; padding: 16px; min-width: 280px;
+  }
+  .card h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .05em;
+             color: var(--muted); margin: 0 0 10px; }
+  button {
+    font: inherit; padding: 8px 14px; border-radius: 8px; cursor: pointer;
+    border: 1px solid var(--line); background: var(--surface); color: var(--ink);
+    margin: 0 6px 6px 0;
+  }
+  button.primary { background: var(--blue); border-color: var(--blue); color: #fff; }
+  button:disabled { opacity: .45; cursor: default; }
+  #status { font-size: 13px; color: var(--muted); margin-top: 4px; }
+  #prompt { font-size: 26px; font-weight: 600; min-height: 40px; }
+  #feed {
+    font: 12px/1.6 ui-monospace, monospace; max-height: 220px; overflow-y: auto;
+    white-space: pre; color: var(--muted);
+  }
+  #feed .tok { color: var(--ink); font-weight: 600; }
+  table { border-collapse: collapse; font-size: 11px; }
+  th, td { border: 1px solid var(--line); padding: 3px 6px; text-align: center;
+           min-width: 34px; }
+  th { color: var(--muted); font-weight: 500; background: var(--bg); }
+  td.diag { outline: 1.5px dotted var(--muted); outline-offset: -2px; }
+  .stat { font-size: 28px; font-weight: 650; }
+  .stat small { font-size: 13px; color: var(--muted); font-weight: 400; }
+  .legend { font-size: 12px; color: var(--muted); margin-top: 8px; }
+</style>
+</head>
+<body>
+<h1>Tactiq ring — live demo</h1>
+<p class="sub">Web Bluetooth dashboard (build-plan step 12). Connect a flashed
+ring over the Nordic UART service, or run the hardware-free demo generator.
+Prompted test replicates the paper's Table 4 protocol in the browser and
+fills the confusion matrix live.</p>
+
+<div class="row">
+  <div class="card">
+    <h2>Connection</h2>
+    <button id="connect" class="primary">Connect ring</button>
+    <button id="demo">Demo mode (no hardware)</button>
+    <div id="status">idle — Web Bluetooth needs Chrome/Edge on localhost or https</div>
+    <h2 style="margin-top:16px">Prompted test</h2>
+    <button id="start" disabled>Start prompted test</button>
+    <button id="stop" disabled>Stop</button>
+    <div id="prompt"></div>
+  </div>
+
+  <div class="card">
+    <h2>Accuracy</h2>
+    <div class="stat" id="acc">–<small> overall</small></div>
+    <div class="stat" id="ntrials" style="font-size:18px">0<small> prompted trials</small></div>
+    <h2 style="margin-top:14px">Confusion matrix <span style="text-transform:none">(intended ↓ / recognised →)</span></h2>
+    <table id="matrix"></table>
+    <div class="legend">Dotted cells: correct answers. Cell shading is a
+    single-hue ramp on the row fraction.</div>
+  </div>
+
+  <div class="card" style="flex:1">
+    <h2>Token feed</h2>
+    <div id="feed"></div>
+  </div>
+</div>
+
+<script>
+"use strict";
+// One vocabulary, shared with host/tactiq/grammar.py and docs/PROTOCOL.md
+const CONTACTS = [
+  { key: "index_tip",   token: "confirm" },
+  { key: "index_base",  token: "back" },
+  { key: "middle_tip",  token: "undo" },
+  { key: "middle_base", token: "next" },
+  { key: "ring_tip",    token: "read" },
+  { key: "ring_base",   token: "previous" },
+  { key: "pinky_tip",   token: "quick_action_1" },
+  { key: "pinky_base",  token: "quick_action_2" },
+];
+const keyIndex = Object.fromEntries(CONTACTS.map((c, i) => [c.key, i]));
+const NUS_SERVICE = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
+const NUS_TX = "6e400003-b5a3-f393-e0a9-e50e24dcca9e";
+
+const $ = id => document.getElementById(id);
+const matrix = Array.from({ length: 8 }, () => new Array(8).fill(0));
+let promptedIdx = null, testing = false, demoTimer = null;
+
+function setStatus(t) { $("status").textContent = t; }
+
+function feedLine(line, isToken) {
+  const div = document.createElement("div");
+  if (isToken) div.className = "tok";
+  div.textContent = line;
+  $("feed").prepend(div);
+  while ($("feed").children.length > 200) $("feed").lastChild.remove();
+}
+
+// ---- confusion matrix rendering -------------------------------------------
+function short(k) { return k.replace("index", "idx").replace("middle", "mid")
+  .replace("pinky", "pky").replace("_tip", "·t").replace("_base", "·b"); }
+
+function renderMatrix() {
+  const tbl = $("matrix");
+  let html = "<tr><th></th>" +
+    CONTACTS.map(c => `<th>${short(c.key)}</th>`).join("") + "</tr>";
+  let correct = 0, total = 0;
+  for (let i = 0; i < 8; i++) {
+    const rowSum = matrix[i].reduce((a, b) => a + b, 0) || 1;
+    html += `<tr><th>${short(CONTACTS[i].key)}</th>`;
+    for (let j = 0; j < 8; j++) {
+      const n = matrix[i][j];
+      total += n;
+      if (i === j) correct += n;
+      const alpha = n ? (0.15 + 0.85 * n / rowSum).toFixed(2) : 0;
+      const fg = n / rowSum > 0.55 ? "#fff" : "var(--ink)";
+      html += `<td class="${i === j ? "diag" : ""}" style="background:rgba(37,99,235,${alpha});color:${n ? fg : "var(--muted)"}">${n || ""}</td>`;
+    }
+    html += "</tr>";
+  }
+  tbl.innerHTML = html;
+  $("ntrials").firstChild.textContent = total;
+  $("acc").firstChild.textContent =
+    total ? Math.round(100 * correct / total) + "%" : "–";
+}
+
+// ---- token handling --------------------------------------------------------
+function handleLine(line) {
+  const isTok = line.startsWith("TOK,");
+  feedLine(line, isTok);
+  if (!isTok) return;
+  const contactKey = line.split(",")[2];
+  const j = keyIndex[contactKey];
+  if (j === undefined) return;
+  if (testing && promptedIdx !== null) {
+    matrix[promptedIdx][j]++;
+    renderMatrix();
+    promptedIdx = null;
+    setTimeout(nextPrompt, 700);
+  }
+}
+
+// ---- prompted test ---------------------------------------------------------
+function speak(text) {
+  if (!("speechSynthesis" in window)) return;
+  const u = new SpeechSynthesisUtterance(text);
+  u.rate = 1.1;
+  speechSynthesis.speak(u);
+}
+
+function nextPrompt() {
+  if (!testing) return;
+  promptedIdx = Math.floor(Math.random() * 8);
+  const label = CONTACTS[promptedIdx].key.replace("_", " ");
+  $("prompt").textContent = "Touch: " + label;
+  speak(label);
+}
+
+$("start").onclick = () => {
+  testing = true;
+  $("start").disabled = true;
+  $("stop").disabled = false;
+  nextPrompt();
+};
+$("stop").onclick = () => {
+  testing = false;
+  promptedIdx = null;
+  $("prompt").textContent = "";
+  $("start").disabled = false;
+  $("stop").disabled = true;
+};
+
+// ---- demo generator (no hardware) -----------------------------------------
+// 94% correct; errors go to the within-finger partner — the confusion
+// structure section 3.5 predicts. Clearly synthetic: for the booth, not
+// for results.
+function demoEmit() {
+  const intended = promptedIdx !== null && testing
+    ? promptedIdx : Math.floor(Math.random() * 8);
+  let recognised = intended;
+  if (Math.random() > 0.94) recognised = intended ^ 1;  // tip<->base partner
+  const c = CONTACTS[recognised];
+  const t = Math.round(performance.now());
+  const dur = Math.round(120 + Math.random() * 220);
+  handleLine(`TOK,${c.token},${c.key},${t},${dur}`);
+}
+
+$("demo").onclick = () => {
+  if (demoTimer) {
+    clearInterval(demoTimer);
+    demoTimer = null;
+    $("demo").textContent = "Demo mode (no hardware)";
+    setStatus("demo stopped");
+    return;
+  }
+  setStatus("DEMO MODE — synthetic tokens, not the ring");
+  $("demo").textContent = "Stop demo";
+  $("start").disabled = false;
+  handleLine("STA,hello,demo");
+  demoTimer = setInterval(() => {
+    // free-run taps when idle; follow the prompt during a test
+    if (!testing || promptedIdx !== null) demoEmit();
+  }, 900);
+};
+
+// ---- Web Bluetooth ---------------------------------------------------------
+$("connect").onclick = async () => {
+  if (!navigator.bluetooth) {
+    setStatus("Web Bluetooth unavailable — use Chrome/Edge over https/localhost");
+    return;
+  }
+  try {
+    setStatus("choosing device…");
+    const device = await navigator.bluetooth.requestDevice({
+      filters: [{ services: [NUS_SERVICE] }],
+    });
+    const gatt = await device.gatt.connect();
+    const svc = await gatt.getPrimaryService(NUS_SERVICE);
+    const tx = await svc.getCharacteristic(NUS_TX);
+    let buf = "";
+    tx.addEventListener("characteristicvaluechanged", e => {
+      buf += new TextDecoder().decode(e.target.value);
+      let nl;
+      while ((nl = buf.indexOf("\n")) >= 0) {
+        const line = buf.slice(0, nl).trim();
+        buf = buf.slice(nl + 1);
+        if (line) handleLine(line);
+      }
+    });
+    await tx.startNotifications();
+    device.addEventListener("gattserverdisconnected",
+      () => setStatus("ring disconnected"));
+    setStatus("connected to " + (device.name || "ring"));
+    $("start").disabled = false;
+  } catch (err) {
+    setStatus("connect failed: " + err.message);
+  }
+};
+
+renderMatrix();
+</script>
+</body>
+</html>
