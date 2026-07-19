@@ -1,0 +1,6 @@
+# capture needs only pyserial (and nothing at all in --sim mode);
+# segmentation/export need the scientific stack
+pyserial>=3.5
+numpy>=1.26
+scipy>=1.11
+pandas>=2.1

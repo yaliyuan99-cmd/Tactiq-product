@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+.DS_Store
+
+# session data stays local: it may contain participant recordings,
+# and the paper's results are built from it deliberately, not by push
+host/data/
